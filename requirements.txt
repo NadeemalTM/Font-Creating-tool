@@ -1,3 +1,5 @@
 fonttools
 requests
 Pillow
+
+streamlit

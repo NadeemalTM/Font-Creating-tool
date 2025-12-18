@@ -8,29 +8,31 @@ from PIL import Image, ImageDraw, ImageFont
 import skeleton_utils
 
 INPUT_FONT = "FM-Malithi-x.ttf"
-OUTPUT_FONT = "FM-Malithi-x-Skeleton-Dotted.ttf"
+OUTPUT_FONT = "FM-Malithi-x-Skeleton-Dashed.ttf"
 RENDER_SIZE = 150  # Height in pixels for skeletonization
 
-def create_dot_glyph(font, dot_radius=20):
-    glyph_name = "dot_marker"
+def create_dash_glyph(font, dash_length=40, dash_thickness=10):
+    glyph_name = "dash_marker"
     if glyph_name in font['glyf']:
         return glyph_name
         
     glyph = Glyph()
     glyph.numberOfContours = 1
     
-    # Create a 12-sided polygon to approximate a circle
-    num_points = 12
-    coords = []
-    for i in range(num_points):
-        angle = 2 * math.pi * i / num_points
-        x = int(dot_radius * math.cos(angle))
-        y = int(dot_radius * math.sin(angle))
-        coords.append((x, y))
-        
-    glyph.endPtsOfContours = [num_points - 1]
+    # Rectangle centered at 0,0
+    half_l = dash_length / 2
+    half_t = dash_thickness / 2
+    
+    coords = [
+        (int(-half_l), int(-half_t)),
+        (int(half_l), int(-half_t)),
+        (int(half_l), int(half_t)),
+        (int(-half_l), int(half_t))
+    ]
+    
+    glyph.endPtsOfContours = [3]
     glyph.coordinates = GlyphCoordinates(coords)
-    glyph.flags = bytearray([1] * num_points)
+    glyph.flags = bytearray([1, 1, 1, 1])
     glyph.program = ttProgram.Program()
     glyph.program.fromBytecode(b"")
     font['glyf'][glyph_name] = glyph
@@ -54,7 +56,10 @@ def process_font():
 
     font = TTFont(INPUT_FONT)
     glyph_order = font.getGlyphOrder()
-    dot_name = create_dot_glyph(font, dot_radius=20)
+    # Dash settings
+    dash_length = 40
+    dash_thickness = 10
+    dash_name = create_dash_glyph(font, dash_length=dash_length, dash_thickness=dash_thickness)
     
     gmap = get_unicode_map(font)
     
@@ -102,7 +107,7 @@ def process_font():
     glyf_table = font['glyf']
     
     for name in glyph_order:
-        if name == dot_name or name == '.notdef':
+        if name == dash_name or name == '.notdef':
             continue
             
         if name not in gmap:
@@ -219,69 +224,105 @@ def process_font():
             fy = -rel_y * scale_factor
             return (fx, fy)
             
-        # Generate dots
-        placed_dots_px = [] # Store (px, py) of placed dots to check distance
-        pixel_spacing = spacing / scale_factor
-        min_dist_sq = (pixel_spacing * 0.6) ** 2 
+        # Generate dashes
+        dashes = []
         
-        def add_dot_checked(px, py):
-            # Check distance against all placed dots
-            for ex, ey in placed_dots_px:
-                if (px-ex)**2 + (py-ey)**2 < min_dist_sq:
-                    return False
-            
+        # Spacing logic for dashes
+        # Stride = dash_length + gap
+        # We place dash center.
+        # dash_length in font units is dash_length.
+        # gap in font units? Let's define gap.
+        gap_length = 20
+        stride = dash_length + gap_length
+        
+        pixel_stride = stride / scale_factor
+        
+        def add_dash(px, py, angle_rad):
             fx, fy = transform_pt(px, py)
-            dots.append((dot_name, (1, 0, 0, 1, int(fx), int(fy))))
-            placed_dots_px.append((px, py))
-            return True
             
+            # Calculate rotation matrix
+            # angle_rad is in pixel coords (y down).
+            # In font coords (y up), dy is flipped.
+            # So angle_font = -angle_pixel
+            
+            f_angle = -angle_rad
+            
+            c = math.cos(f_angle)
+            s = math.sin(f_angle)
+            
+            # Transform: [scale_x, rotate_skew_x, rotate_skew_y, scale_y, x, y]
+            # For pure rotation:
+            # [cos, -sin, sin, cos, x, y]
+            # FontTools GlyphComponent transform is 2x2 matrix [[xx, xy], [yx, yy]]
+            # xx = cos, xy = -sin
+            # yx = sin, yy = cos
+            
+            # Note: F2Dot14 format is handled by fontTools
+            
+            transform = [[c, -s], [s, c]]
+            
+            dashes.append((dash_name, transform, int(fx), int(fy)))
+
         for path in paths:
             if not path: continue
             
-            # Path is list of (x, y)
-            # Convert to font units first?
-            # Or walk in pixels and convert dots?
-            # Walking in pixels is easier for distance calculation if we scale spacing.
-            # Pixel spacing = spacing / scale_factor
+            # Smooth the path
+            path = skeleton_utils.smooth_path(path, iterations=5)
             
-            # pixel_spacing is already defined above
-            
-            curr_idx = 0
-            curr_pt = path[0]
-            
-            # Add first dot
-            add_dot_checked(curr_pt[0], curr_pt[1])
+            # We need to walk the path and place dashes
+            # We start with a dash? Or gap?
+            # Let's start with a dash.
             
             dist_acc = 0
+            # We want to place dashes at intervals.
+            # Center of first dash at 0? No, dash starts at 0.
+            # So center is at dash_length/2.
+            
+            # Actually, simpler:
+            # Walk along path.
+            # State: drawing_dash or gap.
+            # But we are placing components.
+            # So we just need points at:
+            # 0 + L/2, 0 + L + G + L/2, ...
+            
+            next_dash_center = (dash_length / 2) / scale_factor
+            pixel_stride_full = (dash_length + gap_length) / scale_factor
+            
+            # Calculate total path length to avoid partial dashes at end?
+            # Not strictly necessary.
+            
+            current_path_dist = 0
             
             for i in range(len(path) - 1):
                 p1 = path[i]
                 p2 = path[i+1]
                 
-                d = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
-                if d == 0: continue
+                seg_len = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                if seg_len == 0: continue
                 
-                needed = pixel_spacing - dist_acc
-                
-                if d < needed:
-                    dist_acc += d
-                    continue
+                # Check if next_dash_center falls within this segment
+                while next_dash_center <= current_path_dist + seg_len:
+                    # Distance into this segment
+                    d_into_seg = next_dash_center - current_path_dist
                     
-                ux = (p2[0]-p1[0])/d
-                uy = (p2[1]-p1[1])/d
-                
-                current_d = needed
-                while current_d <= d:
-                    nx = p1[0] + ux * current_d
-                    ny = p1[1] + uy * current_d
+                    # Interpolate position
+                    t = d_into_seg / seg_len
+                    nx = p1[0] + (p2[0]-p1[0]) * t
+                    ny = p1[1] + (p2[1]-p1[1]) * t
                     
-                    add_dot_checked(nx, ny)
+                    # Calculate angle
+                    # Use segment angle
+                    dx = p2[0] - p1[0]
+                    dy = p2[1] - p1[1]
+                    angle = math.atan2(dy, dx)
                     
-                    current_d += pixel_spacing
+                    add_dash(nx, ny, angle)
                     
-                dist_acc = d - (current_d - pixel_spacing)
+                    next_dash_center += pixel_stride_full
+                    
+                current_path_dist += seg_len
 
-        if not dots:
+        if not dashes:
             continue
 
         # Replace glyph
@@ -289,12 +330,14 @@ def process_font():
         g.numberOfContours = -1
         g.components = []
         
-        for dn, transform in dots:
+        for dn, transform, x, y in dashes:
             c = GlyphComponent()
             c.glyphName = dn
-            c.x = transform[4]
-            c.y = transform[5]
-            c.flags = 0
+            c.x = x
+            c.y = y
+            c.transform = transform
+            c.flags = 0x200 | 0x800 # WE_HAVE_A_TWO_BY_TWO | WE_HAVE_INSTRUCTIONS (maybe not needed)
+            # Actually fontTools sets flags automatically if we set transform
             g.components.append(c)
             
         count += 1

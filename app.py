@@ -2,34 +2,37 @@ import streamlit as st
 import os
 import math
 import tempfile
+import base64
 from fontTools.ttLib import TTFont
 from fontTools.ttLib.tables._g_l_y_f import Glyph, GlyphComponent, GlyphCoordinates
 from fontTools.ttLib.tables import ttProgram
 from PIL import Image, ImageDraw, ImageFont
 import skeleton_utils
 
-# --- Core Logic (Adapted from create_skeleton_font.py) ---
+# --- Core Logic ---
 
-def create_dot_glyph(font, dot_radius=20):
-    glyph_name = "dot_marker"
+def create_dash_glyph(font, dash_length=40, dash_thickness=10):
+    glyph_name = "dash_marker"
     if glyph_name in font['glyf']:
         return glyph_name
         
     glyph = Glyph()
     glyph.numberOfContours = 1
     
-    # Create a 12-sided polygon to approximate a circle
-    num_points = 12
-    coords = []
-    for i in range(num_points):
-        angle = 2 * math.pi * i / num_points
-        x = int(dot_radius * math.cos(angle))
-        y = int(dot_radius * math.sin(angle))
-        coords.append((x, y))
-        
-    glyph.endPtsOfContours = [num_points - 1]
+    # Rectangle centered at 0,0
+    half_l = dash_length / 2
+    half_t = dash_thickness / 2
+    
+    coords = [
+        (int(-half_l), int(-half_t)),
+        (int(half_l), int(-half_t)),
+        (int(half_l), int(half_t)),
+        (int(-half_l), int(half_t))
+    ]
+    
+    glyph.endPtsOfContours = [3]
     glyph.coordinates = GlyphCoordinates(coords)
-    glyph.flags = bytearray([1] * num_points)
+    glyph.flags = bytearray([1, 1, 1, 1])
     glyph.program = ttProgram.Program()
     glyph.program.fromBytecode(b"")
     font['glyf'][glyph_name] = glyph
@@ -44,10 +47,12 @@ def get_unicode_map(font):
             gmap[name] = chr(code)
     return gmap
 
-def process_font_file(input_path, output_path, dot_radius, spacing, render_size, progress_bar=None):
+def process_font_file(input_path, output_path, dash_length, dash_gap, dash_thickness, render_size, smoothing_iters, progress_bar=None):
     font = TTFont(input_path)
     glyph_order = font.getGlyphOrder()
-    dot_name = create_dot_glyph(font, dot_radius=dot_radius)
+    
+    # Create the dash component
+    dash_name = create_dash_glyph(font, dash_length=dash_length, dash_thickness=dash_thickness)
     
     gmap = get_unicode_map(font)
     
@@ -68,7 +73,7 @@ def process_font_file(input_path, output_path, dot_radius, spacing, render_size,
         if progress_bar:
             progress_bar.progress(idx / total_glyphs)
             
-        if name == dot_name or name == '.notdef':
+        if name == dash_name or name == '.notdef':
             continue
             
         if name not in gmap:
@@ -115,69 +120,70 @@ def process_font_file(input_path, output_path, dot_radius, spacing, render_size,
             fy = -rel_y * scale_factor
             return (fx, fy)
             
-        dots = []
-        placed_dots_px = []
-        pixel_spacing = spacing / scale_factor
-        min_dist_sq = (pixel_spacing * 0.6) ** 2 
+        dashes = []
         
-        def add_dot_checked(px, py):
-            for ex, ey in placed_dots_px:
-                if (px-ex)**2 + (py-ey)**2 < min_dist_sq:
-                    return False
-            
+        # Spacing logic
+        # Stride = dash_length + gap
+        pixel_dash_len = dash_length / scale_factor
+        pixel_gap_len = dash_gap / scale_factor
+        pixel_stride = pixel_dash_len + pixel_gap_len
+        
+        def add_dash(px, py, angle_rad):
             fx, fy = transform_pt(px, py)
-            dots.append((dot_name, (1, 0, 0, 1, int(fx), int(fy))))
-            placed_dots_px.append((px, py))
-            return True
-            
+            f_angle = -angle_rad # Flip angle for font coords
+            c = math.cos(f_angle)
+            s = math.sin(f_angle)
+            transform = [[c, -s], [s, c]]
+            dashes.append((dash_name, transform, int(fx), int(fy)))
+
         for path in paths:
             if not path: continue
             
-            curr_pt = path[0]
-            add_dot_checked(curr_pt[0], curr_pt[1])
+            # Smooth the path further if requested
+            if smoothing_iters > 0:
+                path = skeleton_utils.smooth_path(path, iterations=smoothing_iters)
             
-            dist_acc = 0
+            # Walk path
+            current_path_dist = 0
+            next_dash_center = pixel_dash_len / 2 # Start with a dash
             
             for i in range(len(path) - 1):
                 p1 = path[i]
                 p2 = path[i+1]
                 
-                d = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
-                if d == 0: continue
+                seg_len = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                if seg_len == 0: continue
                 
-                needed = pixel_spacing - dist_acc
-                
-                if d < needed:
-                    dist_acc += d
-                    continue
+                while next_dash_center <= current_path_dist + seg_len:
+                    d_into_seg = next_dash_center - current_path_dist
+                    t = d_into_seg / seg_len
+                    nx = p1[0] + (p2[0]-p1[0]) * t
+                    ny = p1[1] + (p2[1]-p1[1]) * t
                     
-                ux = (p2[0]-p1[0])/d
-                uy = (p2[1]-p1[1])/d
-                
-                current_d = needed
-                while current_d <= d:
-                    nx = p1[0] + ux * current_d
-                    ny = p1[1] + uy * current_d
+                    # Angle from segment
+                    dx = p2[0] - p1[0]
+                    dy = p2[1] - p1[1]
+                    angle = math.atan2(dy, dx)
                     
-                    add_dot_checked(nx, ny)
+                    add_dash(nx, ny, angle)
+                    next_dash_center += pixel_stride
                     
-                    current_d += pixel_spacing
-                    
-                dist_acc = d - (current_d - pixel_spacing)
+                current_path_dist += seg_len
 
-        if not dots:
+        if not dashes:
             continue
 
         g = glyf_table[name]
         g.numberOfContours = -1
         g.components = []
         
-        for dn, transform in dots:
+        for dn, transform, x, y in dashes:
             c = GlyphComponent()
             c.glyphName = dn
-            c.x = transform[4]
-            c.y = transform[5]
-            c.flags = 0
+            c.x = x
+            c.y = y
+            c.transform = transform
+            c.flags = 0x200 | 0x800 
             g.components.append(c)
             
         count += 1
@@ -187,53 +193,92 @@ def process_font_file(input_path, output_path, dot_radius, spacing, render_size,
 
 # --- Streamlit UI ---
 
-st.set_page_config(page_title="Dotted Font Generator", layout="wide")
+st.set_page_config(page_title="Dashed Font Generator", layout="wide")
 
-st.title("Dotted Font Generator")
-st.markdown("Upload a TTF font file to convert it into a single-line dotted font for handwriting practice.")
+st.title("Dashed Font Generator")
+st.markdown("Upload a TTF font file to convert it into a single-line dashed font.")
+
+# Sidebar
+st.sidebar.header("Settings")
+dash_length = st.sidebar.slider("Dash Length (Font Units)", 10, 100, 40)
+dash_gap = st.sidebar.slider("Dash Gap (Font Units)", 10, 100, 20)
+dash_thickness = st.sidebar.slider("Dash Thickness", 2, 20, 6)
+render_size = st.sidebar.slider("Render Resolution", 100, 400, 200, help="Higher = smoother curves but slower")
+smoothing_iters = st.sidebar.slider("Smoothing Iterations", 0, 10, 5, help="Higher = smoother paths")
 
 uploaded_file = st.file_uploader("Choose a TTF file", type="ttf")
 
+if "generated_font_path" not in st.session_state:
+    st.session_state.generated_font_path = None
+
 if uploaded_file is not None:
-    st.sidebar.header("Settings")
-    
-    dot_radius = st.sidebar.slider("Dot Radius", min_value=5, max_value=50, value=20, help="Radius of the dots in font units.")
-    spacing = st.sidebar.slider("Dot Spacing", min_value=20, max_value=150, value=50, help="Distance between dots in font units.")
-    render_size = st.sidebar.slider("Render Resolution", min_value=50, max_value=300, value=150, help="Higher resolution means smoother curves but slower processing.")
-    
-    if st.button("Generate Dotted Font"):
+    if st.button("Generate Dashed Font"):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ttf") as tmp_input:
             tmp_input.write(uploaded_file.getvalue())
             input_path = tmp_input.name
             
-        output_path = input_path.replace(".ttf", "-Dotted.ttf")
+        output_path = input_path.replace(".ttf", "-Dashed.ttf")
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         status_text.text("Processing glyphs...")
         
         try:
-            count = process_font_file(input_path, output_path, dot_radius, spacing, render_size, progress_bar)
+            count = process_font_file(
+                input_path, 
+                output_path, 
+                dash_length, 
+                dash_gap, 
+                dash_thickness, 
+                render_size, 
+                smoothing_iters,
+                progress_bar=progress_bar
+            )
             
-            if isinstance(count, str): # Error message
+            if isinstance(count, str):
                 st.error(count)
             else:
                 st.success(f"Successfully processed {count} glyphs!")
+                st.session_state.generated_font_path = output_path
                 
-                with open(output_path, "rb") as f:
-                    st.download_button(
-                        label="Download Dotted Font",
-                        data=f,
-                        file_name=f"{uploaded_file.name.replace('.ttf', '')}-Dotted.ttf",
-                        mime="font/ttf"
-                    )
-                    
         except Exception as e:
             st.error(f"An error occurred: {e}")
+            if os.path.exists(input_path): os.unlink(input_path)
+
+    # Preview Section
+    if st.session_state.generated_font_path and os.path.exists(st.session_state.generated_font_path):
+        st.markdown("---")
+        st.header("Preview")
+        
+        preview_text = st.text_input("Type text to preview:", "අ ආ ඇ ඈ ඉ ඊ උ ඌ")
+        
+        # Load font as base64
+        with open(st.session_state.generated_font_path, "rb") as f:
+            font_data = f.read()
+            b64_font = base64.b64encode(font_data).decode()
             
-        finally:
-            # Cleanup
-            if os.path.exists(input_path):
-                os.unlink(input_path)
-            if os.path.exists(output_path):
-                os.unlink(output_path)
+        # CSS to inject font
+        font_face = f"""
+        <style>
+        @font-face {{
+            font-family: 'DashedFont';
+            src: url('data:font/ttf;base64,{b64_font}') format('truetype');
+        }}
+        .dashed-text {{
+            font-family: 'DashedFont';
+            font-size: 64px;
+            line-height: 1.5;
+        }}
+        </style>
+        """
+        st.markdown(font_face, unsafe_allow_html=True)
+        st.markdown(f'<p class="dashed-text">{preview_text}</p>', unsafe_allow_html=True)
+        
+        # Download Button
+        with open(st.session_state.generated_font_path, "rb") as f:
+            st.download_button(
+                label="Download Dashed Font",
+                data=f,
+                file_name=f"DashedFont.ttf",
+                mime="font/ttf"
+            )
