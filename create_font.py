@@ -10,8 +10,8 @@ from fontTools.ttLib.tables import ttProgram
 
 # URL for Noto Sans Sinhala Regular
 FONT_URL = "https://github.com/googlefonts/noto-fonts/raw/HEAD/hinted/ttf/NotoSansSinhala/NotoSansSinhala-Regular.ttf"
-INPUT_FONT = "NotoSansSinhala-Regular.ttf"
-OUTPUT_FONT = "SinhalaDotted.ttf"
+INPUT_FONT = "FM-Malithi-x.ttf"
+OUTPUT_FONT = "FM-Malithi-x-Dotted.ttf"
 
 def download_font():
     if not os.path.exists(INPUT_FONT):
@@ -124,10 +124,7 @@ def process_font():
     glyf_table = font['glyf']
     glyph_order = font.getGlyphOrder()
     
-    # We need a DecomposingPen to handle composites (accents etc)
-    # But we want to flatten the result.
-    # So: Glyph -> DecomposingPen -> FlattenPen
-    
+    count = 0
     for name in glyph_order:
         if name == dot_name or name == '.notdef':
             continue
@@ -135,110 +132,27 @@ def process_font():
         if name not in glyf_table:
             continue
             
-        # We need to get the outline.
-        # If it's composite, we decompose it.
-        # We use a temporary pen to capture the flattened path.
         flatten_pen = FlattenPen(glyph_set, flatness=10)
         
         try:
-            # We use the glyphSet to draw, which handles decomposition automatically if we ask for it?
-            # glyph_set[name].draw(flatten_pen) handles decomposition?
-            # Yes, TTGlyph objects in glyphSet usually handle decomposition if they are composites.
             glyph_set[name].draw(flatten_pen)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
             print(f"Error processing {name}: {e}")
             continue
             
-        # Now we have the flattened path in flatten_pen.path
-        # We generate the dots.
-        
-        new_components = []
-        
-        start_pt = None
-        current_pt = None
-        
-        spacing = 80 # Distance between dots
-        remainder = 0 # Leftover distance from previous segment
-        
-        for cmd, pt in flatten_pen.path:
-            if cmd == 'move':
-                start_pt = pt
-                current_pt = pt
-                # Place a dot at start?
-                # Yes
-                new_components.append((dot_name, (1, 0, 0, 1, int(pt[0]), int(pt[1]))))
-                remainder = 0
-                
-            elif cmd == 'line':
-                if current_pt is None: continue
-                
-                # Vector
-                dx = pt[0] - current_pt[0]
-                dy = pt[1] - current_pt[1]
-                dist = math.hypot(dx, dy)
-                
-                if dist == 0: continue
-                
-                # Normalize
-                ux = dx / dist
-                uy = dy / dist
-                
-                # Walk
-                d = spacing - remainder
-                while d <= dist:
-                    nx = current_pt[0] + ux * d
-                    ny = current_pt[1] + uy * d
-                    new_components.append((dot_name, (1, 0, 0, 1, int(nx), int(ny))))
-                    d += spacing
-                
-                remainder = spacing - (d - dist) # How much is left to reach next spacing
-                # Actually: remainder is how far we went past the end point?
-                # No, we want 'remainder' to be "distance covered on this segment that contributes to the NEXT dot"
-                # Wait.
-                # We placed dots at d, d+spacing...
-                # The last dot was at d_last.
-                # Distance from d_last to end is (dist - d_last).
-                # We need (spacing - (dist - d_last)) more to reach next dot.
-                # So remainder = (dist - d_last).
-                # Let's re-logic.
-                # We start at 'remainder' distance from current_pt.
-                # No, 'remainder' is "distance already covered towards the next dot".
-                # So we start placing the first dot at (spacing - remainder).
-                
-                # Correct logic:
-                # We have 'remainder' distance "carried over" from previous segment.
-                # This means we are 'remainder' pixels into the 'spacing' interval.
-                # So the first dot on this new segment should be at 'spacing - remainder'.
-                
-                # Let's track 'distance_since_last_dot'
-                # Initialize distance_since_last_dot = 0 at MoveTo (because we placed a dot there)
-                
-                # Wait, if we place a dot at MoveTo, distance_since_last_dot = 0.
-                pass
-                
-                # Let's rewrite the loop properly
-                
-            elif cmd == 'close':
-                # Connect back to start
-                if current_pt and start_pt:
-                    # Treat as line to start
-                    pass
-                pass
-                
-        # Re-implementing the dot placement logic cleanly
-        
+        if not flatten_pen.path:
+            continue
+
+        # Generate dots along the flattened path
         dots = []
+        spacing = 60 # Distance between dots
         
-        # Helper to add dot
         def add_dot(x, y):
             dots.append((dot_name, (1, 0, 0, 1, int(x), int(y))))
             
-        # Iterate path again
         curr = None
         start = None
-        dist_acc = 0 # Distance accumulated since last dot
+        dist_acc = 0 
         
         for cmd, pt in flatten_pen.path:
             if cmd == 'move':
@@ -252,10 +166,6 @@ def process_font():
                 d = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
                 if d == 0: continue
                 
-                # We want to place dots every 'spacing' units.
-                # We already have 'dist_acc' from previous segment.
-                # We need to reach 'spacing'.
-                
                 needed = spacing - dist_acc
                 
                 if d < needed:
@@ -263,8 +173,6 @@ def process_font():
                     curr = p2
                     continue
                 
-                # We can place at least one dot
-                # First dot at 'needed' from p1
                 ux = (p2[0]-p1[0])/d
                 uy = (p2[1]-p1[1])/d
                 
@@ -275,15 +183,11 @@ def process_font():
                     add_dot(nx, ny)
                     current_d += spacing
                 
-                # Update dist_acc
-                # The last dot was at (current_d - spacing)
-                # Distance from last dot to p2 is d - (current_d - spacing)
                 dist_acc = d - (current_d - spacing)
                 curr = p2
                 
             elif cmd == 'close':
                 if curr and start:
-                    # Same logic as line
                     p1 = curr
                     p2 = start
                     d = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
@@ -302,12 +206,11 @@ def process_font():
                         else:
                             dist_acc += d
                     curr = start
-                    
-        # Now replace glyph
-        # We create a new composite glyph
-        # We can't easily change an existing glyph to composite in place if it was simple?
-        # Yes we can. We just clear contours and add components.
         
+        if not dots:
+            continue
+
+        # Replace glyph with dot components
         g = glyf_table[name]
         g.numberOfContours = -1 # Composite
         g.components = []
@@ -319,10 +222,12 @@ def process_font():
             c.y = transform[5]
             c.flags = 0
             g.components.append(c)
+        
+        count += 1
             
     font.save(OUTPUT_FONT)
-    print(f"Saved {OUTPUT_FONT}")
+    print(f"Saved {OUTPUT_FONT} with {count} processed glyphs")
 
 if __name__ == "__main__":
-    download_font()
+    # download_font()
     process_font()
